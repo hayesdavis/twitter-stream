@@ -1,23 +1,24 @@
 require 'eventmachine'
 require 'em/buftok'
 require 'uri'
+require 'roauth'
 
 module Twitter
   class JSONStream < EventMachine::Connection
     MAX_LINE_LENGTH = 1024*1024
-    
+
     # network failure reconnections
-    NF_RECONNECT_START = 0.25 
+    NF_RECONNECT_START = 0.25
     NF_RECONNECT_ADD   = 0.25
     NF_RECONNECT_MAX   = 16
-    
+
     # app failure reconnections
     AF_RECONNECT_START = 10
     AF_RECONNECT_MUL   = 2
-    
+
     RECONNECT_MAX   = 320
     RETRIES_MAX     = 10
-    
+
     DEFAULT_OPTIONS = {
       :method       => 'GET',
       :path         => '/',
@@ -27,10 +28,13 @@ module Twitter
       :host         => 'stream.twitter.com',
       :port         => 80,
       :ssl          => false,
-      :auth         => 'test:test',
       :user_agent   => 'TwitterStream',
       :timeout      => 0,
-      :proxy        => ENV['HTTP_PROXY']
+      :proxy        => ENV['HTTP_PROXY'],
+      :auth         => nil,
+      :oauth        => {},
+      :filters      => [],
+      :params       => {},
     }
 
     attr_accessor :code
@@ -39,7 +43,7 @@ module Twitter
     attr_accessor :af_last_reconnect
     attr_accessor :reconnect_retries
     attr_accessor :proxy
-    
+
     def self.connect options = {}
       options[:port] = 443 if options[:ssl] && !options.has_key?(:port)
       options = DEFAULT_OPTIONS.merge(options)
@@ -52,7 +56,7 @@ module Twitter
         host = proxy_uri.host
         port = proxy_uri.port
       end
-      
+
       connection = EventMachine.connect host, port, self, options
       connection.start_tls if options[:ssl]
       connection
@@ -65,21 +69,22 @@ module Twitter
       @af_last_reconnect = nil
       @reconnect_retries = 0
       @immediate_reconnect = false
+      @on_inited_callback = options.delete(:on_inited)
       @proxy = URI.parse(options[:proxy]) if options[:proxy]
     end
 
     def each_item &block
       @each_item_callback = block
     end
-    
+
     def on_error &block
       @error_callback = block
     end
-    
+
     def on_reconnect &block
       @reconnect_callback = block
     end
-    
+
     def on_max_reconnects &block
       @max_reconnects_callback = block
     end
@@ -94,7 +99,7 @@ module Twitter
       @gracefully_closed = false
       close_connection
     end
-    
+
     def unbind
       receive_line(@buffer.flush) unless @buffer.empty?
       schedule_reconnect unless @gracefully_closed
@@ -111,26 +116,27 @@ module Twitter
         return
       end
     end
-    
+
     def connection_completed
       send_request
     end
-    
+
     def post_init
       reset_state
+      @on_inited_callback.call if @on_inited_callback
     end
-    
+
   protected
     def schedule_reconnect
       timeout = reconnect_timeout
       @reconnect_retries += 1
       if timeout <= RECONNECT_MAX && @reconnect_retries <= RETRIES_MAX
-        reconnect_after(timeout) 
+        reconnect_after(timeout)
       else
         @max_reconnects_callback.call(timeout, @reconnect_retries) if @max_reconnects_callback
       end
     end
-    
+
     def reconnect_after timeout
       @reconnect_callback.call(timeout, @reconnect_retries) if @reconnect_callback
 
@@ -142,13 +148,13 @@ module Twitter
         end
       end
     end
-    
+
     def reconnect_timeout
       if @immediate_reconnect
         @immediate_reconnect = false
         return 0
       end
-      
+
       if (@code == 0) # network failure
         if @nf_last_reconnect
           @nf_last_reconnect += NF_RECONNECT_ADD
@@ -165,7 +171,7 @@ module Twitter
         @af_last_reconnect
       end
     end
-  
+
     def reset_state
       set_comm_inactivity_timeout @options[:timeout] if @options[:timeout] > 0
       @code    = 0
@@ -177,23 +183,43 @@ module Twitter
     def send_request
       data = []
       request_uri = @options[:path]
+
       if @proxy
         # proxies need the request to be for the full url
-        request_uri = "http#{'s' if @options[:ssl]}://#{@options[:host]}:#{@options[:port]}#{request_uri}"
+        request_uri = "#{uri_base}:#{@options[:port]}#{request_uri}"
       end
+
+      content = @options[:content]
+
+      unless (q = query).empty?
+        if @options[:method].to_s.upcase == 'GET'
+          request_uri << "?#{q}"
+        else
+          content = q
+        end
+      end
+
       data << "#{@options[:method]} #{request_uri} HTTP/1.1"
       data << "Host: #{@options[:host]}"
-      data << "User-agent: #{@options[:user_agent]}" if @options[:user_agent]
-      data << "Authorization: Basic " + [@options[:auth]].pack('m').delete("\r\n")
+      data << 'Accept: */*'
+      data << "User-Agent: #{@options[:user_agent]}" if @options[:user_agent]
+
+      if @options[:auth]
+        data << "Authorization: Basic #{[@options[:auth]].pack('m').delete("\r\n")}"
+      elsif @options[:oauth]
+        data << "Authorization: #{oauth_header}"
+      end
+
       if @proxy && @proxy.user
         data << "Proxy-Authorization: Basic " + ["#{@proxy.user}:#{@proxy.password}"].pack('m').delete("\r\n")
       end
       if @options[:method] == 'POST'
         data << "Content-type: #{@options[:content_type]}"
-        data << "Content-length: #{@options[:content].length}"
+        data << "Content-length: #{content.length}"
       end
       data << "\r\n"
-      send_data data.join("\r\n") + @options[:content]
+
+      send_data data.join("\r\n") << content
     end
 
     def receive_line ln
@@ -240,11 +266,51 @@ module Twitter
         close_connection
       end
     end
-    
+
     def reset_timeouts
       @nf_last_reconnect = @af_last_reconnect = nil
       @reconnect_retries = 0
     end
 
-  end  
+    #
+    # URL and request components
+    #
+
+    # :filters => %w(miama lebron jesus)
+    # :oauth => {
+    #   :consumer_key    => [key],
+    #   :consumer_secret => [token],
+    #   :access_key      => [access key],
+    #   :access_secret   => [access secret]
+    # }
+    def oauth_header
+      uri = uri_base + @options[:path]
+      ::ROAuth.header(@options[:oauth], uri, params, @options[:method])
+    end
+
+    # Scheme (https if ssl, http otherwise) and host part of URL
+    def uri_base
+      "http#{'s' if @options[:ssl]}://#{@options[:host]}"
+    end
+
+    # Normalized query hash of escaped string keys and escaped string values
+    # nil values are skipped
+    def params
+      flat = {}
+      @options[:params].merge( :track => @options[:filters] ).each do |param, val|
+        next if val.empty?
+        val = val.join(",") if val.respond_to?(:join)
+        flat[escape(param)] = escape(val)
+      end
+      flat
+    end
+
+    def query
+      params.map{|pair| pair.join("=")}.sort.join("&")
+    end
+
+    def escape str
+      URI.escape(str.to_s, /[^a-zA-Z0-9\-\.\_\~]/)
+    end
+  end
 end

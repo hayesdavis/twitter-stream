@@ -4,6 +4,22 @@ require 'twitter/json_stream'
 
 include Twitter
 
+Host = "127.0.0.1"
+Port = 9550
+
+class JSONServer < EM::Connection
+  attr_accessor :data
+  def receive_data data
+    $recieved_data = data
+    send_data $data_to_send
+    EventMachine.next_tick {
+      close_connection if $close_connection
+    }
+  end
+end
+
+
+
 describe JSONStream do
   
   context "on create" do
@@ -36,26 +52,22 @@ describe JSONStream do
     end
   end
   
-  Host = "127.0.0.1"
-  Port = 9550
-  
-  class JSONServer < EM::Connection
-    attr_accessor :data
-    def receive_data data
-      $recieved_data = data
-      send_data $data_to_send
-      EventMachine.next_tick {
-        close_connection if $close_connection
-      }
-    end
-  end
-  
   context "on valid stream" do
     attr_reader :stream
     before :each do
       $data_to_send = read_fixture('twitter/basic_http.txt')
       $recieved_data = ''
       $close_connection = false
+    end
+    
+    it "should add no params" do
+      connect_stream
+      $recieved_data.should include('/1/statuses/filter.json HTTP')
+    end
+    
+    it "should add custom params" do
+      connect_stream :params => {:name => 'test'}
+      $recieved_data.should include('?name=test')
     end
     
     it "should parse headers" do
