@@ -34,6 +34,7 @@ module Twitter
       :auth         => nil,
       :oauth        => {},
       :filters      => [],
+      :headers      => {},
       :params       => {},
     }
 
@@ -217,7 +218,14 @@ module Twitter
         data << "Content-type: #{@options[:content_type]}"
         data << "Content-length: #{content.length}"
       end
+      if @options[:headers]
+        @options[:headers].each do |name,value|
+          data << "#{name}: #{value}"
+        end
+      end
       data << "\r\n"
+      
+      puts data.join("\r\n")
 
       send_data data.join("\r\n") << content
     end
@@ -257,6 +265,7 @@ module Twitter
     end
 
     def parse_response_line ln
+      puts "Response: #{ln}"
       if ln =~ /\AHTTP\/1\.[01] ([\d]{3})/
         @code = $1.to_i
         @state = :headers
