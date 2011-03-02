@@ -89,6 +89,11 @@ describe JSONStream do
       $recieved_data.upcase.should include('USER-AGENT: TEST_USER_AGENT')
     end
     
+    it "should permit custom headers" do
+      connect_stream :headers=>{"X-Custom-Header"=>"Custom"}
+      $recieved_data.upcase.should include('X-CUSTOM-HEADER: CUSTOM')
+    end
+    
     it "should deliver each item" do
       items = []
       connect_stream do
