@@ -2,6 +2,7 @@ require 'eventmachine'
 require 'em/buftok'
 require 'uri'
 require 'roauth'
+require 'http/parser'
 
 module Twitter
   class JSONStream < EventMachine::Connection
@@ -102,20 +103,16 @@ module Twitter
     end
 
     def unbind
-      receive_line(@buffer.flush) unless @buffer.empty?
+      if @state == :stream && !@buffer.empty?
+        parse_stream_line(@buffer.flush)
+      end
       schedule_reconnect unless @gracefully_closed
     end
 
-    def receive_data data
-      begin
-        @buffer.extract(data).each do |line|
-          receive_line(line)
-        end
-      rescue Exception => e
-        receive_error("#{e.class}: " + [e.message, e.backtrace].flatten.join("\n\t"))
-        close_connection
-        return
-      end
+    # Receives raw data from the HTTP connection and pushes it into the 
+    # HTTP parser which then drives subsequent callbacks.
+    def receive_data(data)
+      @parser << data
     end
 
     def connection_completed
@@ -179,6 +176,35 @@ module Twitter
       @headers = []
       @state   = :init
       @buffer  = BufferedTokenizer.new("\r", MAX_LINE_LENGTH)
+
+      @parser  = Http::Parser.new
+      @parser.on_headers_complete = method(:handle_headers_complete)
+      @parser.on_body = method(:receive_stream_data)
+    end
+
+    # Called when the status line and all headers have been read from the
+    # stream.
+    def handle_headers_complete(headers)
+      @code = @parser.status_code.to_i
+      if @code != 200
+        receive_error("invalid status code: #{@code}.")
+      end
+      self.headers = headers
+      @state = :stream
+    end
+
+    # Called every time a chunk of data is read from the connection once it has
+    # been opened and after the headers have been processed.
+    def receive_stream_data(data)
+      begin
+        @buffer.extract(data).each do |line|
+          parse_stream_line(line)
+        end
+      rescue Exception => e
+        receive_error("#{e.class}: " + [e.message, e.backtrace].flatten.join("\n\t"))
+        close_connection
+        return
+      end
     end
 
     def send_request
@@ -224,21 +250,8 @@ module Twitter
         end
       end
       data << "\r\n"
-      
-      puts data.join("\r\n")
 
       send_data data.join("\r\n") << content
-    end
-
-    def receive_line ln
-      case @state
-      when :init
-        parse_response_line ln
-      when :headers
-        parse_header_line ln
-      when :stream
-        parse_stream_line ln
-      end
     end
 
     def receive_error e
@@ -251,28 +264,6 @@ module Twitter
         if ln[0,1] == '{'
           @each_item_callback.call(ln) if @each_item_callback
         end
-      end
-    end
-
-    def parse_header_line ln
-      ln.strip!
-      if ln.empty?
-        reset_timeouts if @code == 200
-        @state = :stream
-      else
-        headers << ln
-      end
-    end
-
-    def parse_response_line ln
-      puts "Response: #{ln}"
-      if ln =~ /\AHTTP\/1\.[01] ([\d]{3})/
-        @code = $1.to_i
-        @state = :headers
-        receive_error("invalid status code: #{@code}. #{ln}") unless @code == 200
-      else
-        receive_error('invalid response')
-        close_connection
       end
     end
 
