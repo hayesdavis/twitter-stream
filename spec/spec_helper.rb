@@ -48,6 +48,19 @@ def http_response(status_code, status_text, headers, body)
   res
 end
 
+# Take some content and turn it into randomly sized chunks
+def chunk_content(content, max_size = 20)
+  chunks = []
+  i = 0
+  size = 1+rand(max_size-1)
+  while !(chunk = content[i,size]).nil?
+    chunks << chunk
+    i += size
+    size = 1+rand(max_size-1)
+  end
+  chunks
+end
+
 def http_chunk(data)
   # See http://www.w3.org/Protocols/rfc2616/rfc2616-sec3.html#sec3.6.1
   "#{data.length.to_s(16)}\r\n#{data}\r\n"

@@ -3,9 +3,41 @@ require 'em/buftok'
 require 'uri'
 require 'roauth'
 require 'http/parser'
+require 'zlib'
 
 module Twitter
   class JSONStream < EventMachine::Connection
+
+    # Identity decode just returns the same data givent to it. This is the 
+    # default Content-Enoding (i.e. no compression). 
+    # See http://tools.ietf.org/html/rfc2616#section-3.5
+    class IdentityDecoder
+      def decode(data)
+        data
+      end
+    end
+
+    # Zlib decoder can decode response content with a Content-Enoding set to
+    # either gzip or deflate.
+    # See http://tools.ietf.org/html/rfc2616#section-3.5
+    class ZlibDecoder
+      def initialize
+        # Adding 32 to MAX_WBITS (which is 15) tells zlib to handle either 
+        # zlib or gzip decoding with automatic header detection. See 
+        # http://zlib.net/manual.html and Ruby's zlib.c source
+        @inflater = Zlib::Inflate.new(Zlib::MAX_WBITS+32)
+      end
+
+      # Inflates the specified data. This method may return an empty string if 
+      # the zlib implementation has to buffer the data until there is enough to 
+      # actually inflate. For example, if the specified data contains only a 
+      # gzip header (which, of course, doesn't represent real data) then this 
+      # method will return an empty string.
+      def decode(data)
+        @inflater.inflate(data)
+      end
+    end
+
     MAX_LINE_LENGTH = 1024*1024
 
     # network failure reconnections
@@ -190,21 +222,38 @@ module Twitter
         receive_error("invalid status code: #{@code}.")
       end
       self.headers = headers
+      if /gzip|deflate/i =~ headers["Content-Encoding"]
+        @decoder = ZlibDecoder.new
+      else
+        @decoder = IdentityDecoder.new
+      end
       @state = :stream
     end
 
     # Called every time a chunk of data is read from the connection once it has
     # been opened and after the headers have been processed.
     def receive_stream_data(data)
+      data = decode(data)
       begin
-        @buffer.extract(data).each do |line|
-          parse_stream_line(line)
+        # Check this here because there is a bug in BufferedTokenizer#extract 
+        # that will raise an error if passed an empty string. Since the decode 
+        # step can return an empty string, we just ignore it if it does.
+        if data && data.length > 0
+          @buffer.extract(data).each do |line|
+            parse_stream_line(line)
+          end
         end
       rescue Exception => e
         receive_error("#{e.class}: " + [e.message, e.backtrace].flatten.join("\n\t"))
         close_connection
         return
       end
+    end
+
+    # Uses the decoder determined by the Content-Coding header to decode a 
+    # chunk of content
+    def decode(chunk)
+      @decoder.decode(chunk)
     end
 
     def send_request

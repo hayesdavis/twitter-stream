@@ -1,6 +1,7 @@
 $:.unshift "."
 require File.dirname(__FILE__) + '/../spec_helper.rb'
 require 'twitter/json_stream'
+require 'stringio'
 
 include Twitter
 
@@ -17,8 +18,6 @@ class JSONServer < EM::Connection
     }
   end
 end
-
-
 
 describe JSONStream do
   
@@ -248,6 +247,60 @@ describe JSONStream do
       items[0].should == '{"id":1234}'
       items[1].should == '{"id":9876}'
     end
+  end
+
+  context "on compressed stream with chunked transfer encoding" do
+    attr_reader :stream
+
+    before :each do
+      $recieved_data = ''
+      $close_connection = false
+    end
+
+    it "should decompress gzipped entities correctly" do
+      raw_body = %Q({"screen_name":"user1"}\r{"id":9876})
+
+      body = ""
+      gzw = Zlib::GzipWriter.new(StringIO.new(body))
+      gzw.write(raw_body)
+      gzw.flush
+
+      # Don't close the gzip writer before chunking because we don't want the 
+      # content to sent to the connection to have a gzip footer because a real 
+      # stream would not
+      body = chunk_content(body)
+      gzw.close
+
+      $data_to_send = http_response(200,"OK",{"Content-Encoding"=>"gzip"},body)
+      items = []
+      connect_stream do
+        stream.each_item do |item|
+          items << item
+        end
+      end
+      items.size.should == 2
+      items[0].should == '{"screen_name":"user1"}'
+      items[1].should == '{"id":9876}'
+    end
+
+    it "should decompress deflated entities correctly" do
+      raw_body = %Q({"screen_name":"user1"}\r{"id":9876})
+
+      body = Zlib::Deflate.deflate(raw_body)
+      body = chunk_content(body)
+
+      $data_to_send = http_response(200,"OK",{"Content-Encoding"=>"deflate"},body)
+      items = []
+      connect_stream do
+        stream.each_item do |item|
+          items << item
+        end
+      end
+      items.size.should == 2
+      items[0].should == '{"screen_name":"user1"}'
+      items[1].should == '{"id":9876}'
+    end
+
   end
 
 end
